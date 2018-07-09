@@ -1,5 +1,27 @@
 use super::{Access, Statement, Dependency, DependencyEdge};
 
+pub(super) fn find_deps_for_var(sorted_access: &[Access]) {
+	let mut fsm = StateMachine::new();
+
+	let mut iter = sorted_access.iter();
+	let mut last = match iter.next() {
+		Some(l) => l,
+		None => return
+	};
+
+	while let Some(access) = iter.next() {
+		if let Some(dep) = fsm.transition(last) {
+			println!("{:?}", dep);
+		}
+
+		if access.indices != last.indices {
+			fsm = StateMachine::new();
+		}
+
+		last = access;
+	}
+}
+
 enum State {
 	Uninitialized,
 	Read { statement: Statement, last_write: Option<Statement> },
@@ -16,7 +38,7 @@ impl StateMachine {
 		StateMachine { state }
 	}
 
-	fn transition(&mut self, access: Access) -> Option<Dependency> {
+	fn transition(&mut self, access: &Access) -> Option<Dependency> {
 		use super::Category::*;
 
 		let mut dependency = None;
@@ -41,7 +63,7 @@ impl StateMachine {
 				match access.category {
 					Read => {
 						if let Some(write) = last_write {
-							let dep = DependencyEdge(statement, write);
+							let dep = DependencyEdge(write, statement);
 							dependency = Some(Dependency::True(dep));
 						}
 
@@ -51,7 +73,7 @@ impl StateMachine {
 						}
 					},
 					Write => {
-						let dep = DependencyEdge(statement, last_read);
+						let dep = DependencyEdge(last_read, statement);
 						dependency = Some(Dependency::Anti(dep));
 
 						State::Write {
@@ -62,7 +84,7 @@ impl StateMachine {
 			}
 			State::Write { statement: last_write } => {
 				let statement = access.statement;
-				let dep = DependencyEdge(statement, last_write);
+				let dep = DependencyEdge(last_write, statement);
 
 				match access.category {
 					Read => {

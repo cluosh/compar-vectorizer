@@ -1,8 +1,8 @@
-use std::{io, str::FromStr, collections::HashMap};
+use std::{io, str::FromStr, collections::HashMap, cmp::Ordering};
 use nom::{digit, types::CompleteStr};
 use super::{TraceError, Category, Access};
 
-fn read_trace<T>(input: T) -> Vec<Access>
+pub(super) fn read_trace<T>(input: T) -> Vec<Access>
 	where T: io::BufRead
 {
 	let mut access = Vec::new();
@@ -19,7 +19,7 @@ fn read_trace<T>(input: T) -> Vec<Access>
 	access
 }
 
-fn split_and_sort_trace(trace: Vec<Access>) -> HashMap<String, Vec<Access>> {
+pub(super) fn split_and_sort_trace(trace: Vec<Access>) -> HashMap<String, Vec<Access>> {
 	let mut map: HashMap<String, Vec<Access>> = HashMap::new();
 
 	for a in trace {
@@ -43,6 +43,24 @@ impl FromStr for Access {
 			Ok((_, a)) => Ok(a),
 			Err(_) => Err(TraceError::ParseAccessError)
 		}
+	}
+}
+
+impl Ord for Access {
+	fn cmp(&self, other: &Access) -> Ordering {
+		self.indices.cmp(&other.indices)
+	}
+}
+
+impl PartialOrd for Access {
+	fn partial_cmp(&self, other: &Access) -> Option<Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+impl PartialEq for Access {
+	fn eq(&self, other: &Access) -> bool {
+		self.indices == other.indices
 	}
 }
 
