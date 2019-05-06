@@ -1,95 +1,48 @@
-mod trace_parser;
-mod trace_deps;
-mod graph;
-mod ir_parse;
-
-use std::{io, collections::{HashSet, HashMap}};
+use std::io;
+use std::collections::{HashSet, HashMap};
 use petgraph::{Graph, algo::{tarjan_scc, is_cyclic_directed}};
-use self::trace_parser::{read_trace, split_and_sort_trace};
-use self::trace_deps::find_deps_for_var;
-use self::graph::{build_graph, print_graph};
+use ::dependencies::{LoopLabel, Statement, LevelDependency, Level};
+use ::ir::{Ast, Loop, Assign};
+use ::codegen::{Codegen, Vectorizer, Generator};
 
-pub use self::ir_parse::*;
+pub fn vectorize<W>(
+	graph: &Graph<Statement, Vec<LevelDependency>>,
+	ast: &Ast,
+	writer: W,
+	fold: bool
+) -> io::Result<()>
+	where W: io::Write
+{
+	let mut loop_map = HashMap::new();
+	ast_loops(&ast.statements.0, &mut loop_map);
 
-pub fn vectorize(trace_file: &str, ast_file: &str) -> Result<(), io::Error> {
-	use std::io::Read;
-	use std::fs::File;
+	let mut loop_cur = Vec::new();
+	let mut stat_map = HashMap::new();
+	let mut stat_lps = HashMap::new();
+	ast_statements(&ast.statements.0, &mut loop_cur, &mut stat_map, &mut stat_lps);
 
-	let trace_file = File::open(trace_file)?;
-	let input = io::BufReader::new(trace_file);
-
-	let (instances, trace) = read_trace(input);
-	let trace = split_and_sort_trace(trace);
-
-	// Find dependencies
-	let mut dependencies = HashMap::new();
-	for var in trace.values() {
-		find_deps_for_var(var, &instances, &mut dependencies);
-	}
-
-	// Find statements in instances
-	let mut statements = instances.iter()
-		.map(|i| i.statement)
-		.collect::<HashSet<_>>()
-		.into_iter()
-		.collect::<Vec<_>>();
-	statements.sort();
-
-	// Find statement loop info in instances
-	let stat_loops = instances.iter()
-		.map(|i| (i.statement, i.loops.clone()))
-		.collect::<HashMap<_,_>>();
-
-	// Collect dependencies into array
-	let dependencies = dependencies
-		.into_iter()
-		.map(|(edge, level_deps)| {
-			let mut level_deps: Vec<_>= level_deps.into_iter().collect();
-			level_deps.sort_by_key(|d| d.0);
-			Dependency { edge, level_deps }
-		})
-		.collect::<Vec<_>>();
-
-	// Read AST
-	let ast_file = File::open(ast_file)?;
-	let mut input = io::BufReader::new(ast_file);
-	let mut ast = String::new();
-    input.read_to_string(&mut ast).unwrap();
-    ast.push_str(" $");
-    let ast = ast.replace('\n', " ");
-    let ast = ast.replace('\t', " ");
-
-    let ast = match parse_ast(&ast) {
-    	Ok((_, ast)) => ast,
-    	Err(_) => {
-    		eprintln!("Could not parse AST.");
-    		return Ok(());
-    	}
-    };
-
-    let mut loop_map = HashMap::new();
-    ast_loops(&ast.statements.0, &mut loop_map);
-    let mut stat_map = HashMap::new();
-    ast_statements(&ast.statements.0, &mut stat_map);
-
-	// Build layered dependence graph
-	let graph = build_graph(statements, dependencies);
-	print_graph(&graph, "out_deps.dot")?;
-
-	// Vectorize
-	allen_kennedy(graph, &ast, &loop_map, &stat_map, &stat_loops, 1);
-
-	Ok(())
+	// Generate code
+	let mut cg: Codegen<Vectorizer<_>, _> = if fold {
+		Codegen::new_folding(writer)
+	} else {
+		Codegen::new(writer)
+	};
+	cg.generate_header(ast)?;
+	allen_kennedy(&mut cg, graph, ast, &loop_map, &stat_map, &stat_lps, 0)?;
+	cg.generate_footer(ast)
 }
 
-fn allen_kennedy(
-	graph: Graph<u32, Vec<LevelDependency>>,
-	ast: &Ast,
-	loop_map: &HashMap<i32, &Loop>,
-	stat_map: &HashMap<i32, &Assign>,
-	stat_loops: &HashMap<u32, Vec<LoopLabel>>,
-	loop_level: u32
-) {
+fn allen_kennedy<'a, G, W>(
+	codegen: &mut Codegen<G, W>,
+	graph: &Graph<Statement, Vec<LevelDependency>>,
+	ast: &'a Ast,
+	loop_map: &HashMap<LoopLabel, &'a Loop>,
+	stat_map: &HashMap<Statement, &'a Assign>,
+	stat_lps: &HashMap<Statement, Vec<LoopLabel>>,
+	c: Level
+) -> io::Result<()>
+	where G: Generator<'a, G, W>, W: io::Write
+{
 	// Filter dependencies for adequate loop level
 	let graph = graph.filter_map(|_, n| {
 		Some(*n)
@@ -97,7 +50,7 @@ fn allen_kennedy(
 		// Filter dependencies by depth
 		let mut new_ldeps = Vec::new();
 		for ldep in e.iter() {
-			if ldep.0 == 0 || ldep.0 >= loop_level {
+			if ldep.0 == 0 || ldep.0 > c {
 				new_ldeps.push(ldep.clone());
 			}
 		}
@@ -130,76 +83,95 @@ fn allen_kennedy(
 		}, |_, e| Some(e.clone()));
 
 		if is_cyclic_directed(&subgraph) {
-			println!("for i_{0:} = lb_{0:} to ub_{0:}", loop_level);
-			allen_kennedy(subgraph, ast, loop_map, stat_map, stat_loops, loop_level + 1);
-			println!("endfor");
+			if let Some(n) = sub_nodes.first() {
+				let stat = graph.node_weight(*n).unwrap_or(&-1);
+				let l = match stat_lps.get(stat) {
+					Some(l) => l,
+					None => return Err(io::Error::new(io::ErrorKind::Other, format!("Could not lookup loops for statement {}", stat)))
+				};
+
+				if l.len() <= c as usize {
+					return Err(io::Error::new(io::ErrorKind::Other, format!("Not enough loops for statement {}", stat)));
+				}
+
+				let l = match loop_map.get(&l[c as usize]) {
+					Some(l) => l,
+					None => return Err(io::Error::new(io::ErrorKind::Other, format!("Could not lookup loop with label {}", l[c as usize])))
+				};
+
+				codegen.generate_loop_vec_start(l, c)?;
+				allen_kennedy(
+					codegen, &subgraph, ast, loop_map, stat_map,
+					stat_lps, c + 1)?;
+				codegen.generate_loop_vec_end(l, c)?;
+			} else {
+				return Err(io::Error::new(io::ErrorKind::Other, format!("No nodes in subgraph at level {}", c + 1)));
+			}
 		} else {
 			for node in sub_nodes.iter() {
 				if let Some(stat) = graph.node_weight(*node) {
-					let loops = &stat_loops[stat];
+					let assign = match stat_map.get(stat) {
+						Some(s) => s,
+						None => return Err(io::Error::new(io::ErrorKind::Other, format!("Could not lookup statement {}", stat)))
+					};
+					let loops = match stat_lps.get(stat) {
+						Some(l) => l,
+						None => return Err(io::Error::new(io::ErrorKind::Other, format!("Could not lookup loops for statement {}", stat)))
+					};
 
-					
+					let mut stat_loops = HashMap::new();
+					if loops.len() > c as usize {
+						for label in &loops[c as usize..] {
+							let l = match loop_map.get(label) {
+								Some(l) => *l,
+								None => return Err(io::Error::new(io::ErrorKind::Other, format!("Could not lookup loop with label: {}", label)))
+							};
+							stat_loops.insert(l.var.to_owned(), l);
+						}
+					}
+
+					codegen.set_loop_data(stat_loops);
+					codegen.generate_assignment(assign, c as u8)?;
 				}
 			}
-			// GENERATE VECTOR CODE "S(i1,...,ic-1,lb_c:ub_c,...,lb_n:ub_n)"
-			println!("GENERATE VECTOR CODE");
 		}
-	} 
+	}
+
+	Ok(())
 }
 
-#[derive(Debug)]
-enum TraceError {
-	ParseAccessError
+fn ast_loops<'a>(
+	statements: &'a[::ir::Statement],
+	loop_map: &mut HashMap<LoopLabel, &'a Loop>
+) {
+	for s in statements {
+		if let ::ir::Statement::Loop(l) = s {
+			loop_map.insert(l.label, l);
+			ast_loops(&l.statements.0, loop_map);
+		}
+	}
 }
 
-type Statement = u32;
-type LoopLabel = u32;
-pub type Level = u32;
-
-#[derive(Debug,Hash,Eq,PartialEq,Clone)]
-struct DependencyEdge(Statement,Statement);
-
-#[derive(Debug,Clone,Eq,PartialEq)]
-enum Category {
-	Read,
-	Write
-}
-
-#[derive(Debug,Clone,Eq)]
-struct Access {
-	statement: Statement,
-	array: String,
-	category: Category,
-	indices: Vec<u32>
-}
-
-#[derive(Debug,Hash,Eq,PartialEq,Clone)]
-pub enum DependencyType {
-	True,
-	Anti,
-	Output
-}
-
-#[derive(Debug,Hash,Eq,PartialEq,Clone)]
-pub struct LevelDependency(Level, DependencyType);
-
-#[derive(Debug)]
-struct Dependency {
-	edge: DependencyEdge,
-	level_deps: Vec<LevelDependency>
-}
-
-#[derive(Debug)]
-struct StatementInstance {
-	statement: Statement,
-	loops: Vec<LoopLabel>,
-	iteration: Vec<i32>
-}
-
-#[derive(Debug)]
-enum TraceOutput {
-	Access(Access),
-	LoopBegin(LoopLabel),
-	LoopEnd,
-	LoopUpdate(i32),
+pub fn ast_statements<'a>(
+	statements: &'a[::ir::Statement],
+	loop_cur: &mut Vec<LoopLabel>,
+	stat_map: &mut HashMap<Statement, &'a Assign>,
+	stat_lps: &mut HashMap<Statement, Vec<LoopLabel>>
+) {
+	for s in statements {
+		match s {
+			::ir::Statement::Loop(l) => {
+				loop_cur.push(l.label);
+				ast_statements(&l.statements.0, loop_cur, stat_map, stat_lps);
+				loop_cur.pop();
+			}
+			::ir::Statement::Assignment(a) => {
+				stat_map.insert(a.label, a);
+				stat_lps.insert(a.label, loop_cur.clone());
+			}
+			::ir::Statement::If(_) => {
+				eprintln!("IF-Statements not supported in Vectorization");
+			}
+		}
+	}
 }

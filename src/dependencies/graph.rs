@@ -3,7 +3,7 @@ use std::{io, fs::File};
 use super::*;
 
 pub(super) fn build_graph(statements: Vec<Statement>, deps: Vec<Dependency>)
-	-> Graph<u32, Vec<LevelDependency>>
+	-> Graph<Statement, Vec<LevelDependency>>
 {
 	let mut graph = Graph::new();
 
@@ -20,8 +20,8 @@ pub(super) fn build_graph(statements: Vec<Statement>, deps: Vec<Dependency>)
 	graph
 }
 
-pub(super) fn print_graph(
-	graph: &Graph<u32, Vec<LevelDependency>>,
+pub fn print_graph(
+	graph: &Graph<Statement, Vec<LevelDependency>>,
 	file_name: &str
 ) -> Result<(),io::Error>
 {
@@ -36,7 +36,7 @@ pub(super) fn print_graph(
 	for (i, subgraph) in scc.into_iter().enumerate() {
 		writeln!(writer, "  subgraph cluster_{} {{", i)?;
 		for index in subgraph {
-			writeln!(writer, "    s{} [label=\"S{}\"];", index.index(), graph[index])?;
+			writeln!(writer, "    s{0:} [label=\"S{0:}\"];", graph[index])?;
 		}
 		writeln!(writer, "    graph[style=dotted];")?;
 		writeln!(writer, "  }}")?;
@@ -44,8 +44,8 @@ pub(super) fn print_graph(
 	}
 
 	for edge in graph.raw_edges().iter() {
-		writeln!(writer, "  s{} -> ", edge.source().index())?;
-		writeln!(writer,"s{} [label = \"", edge.target().index())?;
+		write!(writer, "  s{} -> ", graph[edge.source()])?;
+		write!(writer,"s{} [label=\"", graph[edge.target()])?;
 		for LevelDependency(level, dep) in edge.weight.iter() {
 			match dep {
 				DependencyType::Anti => write!(writer, " A{}", level)?,

@@ -1,104 +1,6 @@
 use nom::{double_s, digit};
-use std::{str::FromStr, collections::HashMap};
-
-pub fn ast_loops<'a>(
-	statements: &'a[Statement],
-	loop_map: &mut HashMap<i32, &'a Loop>
-) {
-	for s in statements {
-		if let Statement::Loop(l) = s {
-			loop_map.insert(l.label, l);
-			ast_loops(&l.statements.0, loop_map);
-		}
-	}
-}
-
-pub fn ast_statements<'a>(
-	statements: &'a[Statement],
-	stat_map: &mut HashMap<i32, &'a Assign>
-) {
-	for s in statements {
-		match s {
-			Statement::Loop(l) => ast_statements(&l.statements.0, stat_map),
-			Statement::Assignment(a) => { stat_map.insert(a.label, a); }
-		}
-	}
-}
-
-#[derive(Debug)]
-pub struct Ast {
-	pub name: String,
-	pub vardef: Vec<Definition>,
-	pub statements: StatementList
-}
-
-#[derive(Debug)]
-pub struct Definition {
-	pub name: String,
-	pub dimensions: Vec<(i32,i32)>,
-	pub dtype: DefinitionType
-}
-
-#[derive(Debug)]
-pub enum DefinitionType {
-	Real,
-	Integer
-}
-
-#[derive(Debug)]
-pub struct StatementList(pub Vec<Statement>);
-
-#[derive(Debug)]
-pub enum Statement {
-	Assignment(Assign),
-	Loop(Loop)
-}
-
-#[derive(Debug)]
-pub struct Assign {
-	pub label: i32,
-	pub lhs: Variable,
-	pub rhs: Expression
-}
-
-#[derive(Debug)]
-pub struct Loop {
-	pub label: i32,
-	pub var: String,
-	pub lower: i32,
-	pub upper: i32,
-	pub step: i32,
-	pub statements: StatementList
-}
-
-#[derive(Debug)]
-pub struct Variable {
-	pub name: String,
-	pub indices: Vec<Expression>
-}
-
-#[derive(Debug)]
-pub enum Expression {
-	Integer(i32),
-	Real(f64),
-	BinOp(Box<BinOp>),
-	Variable(Variable)
-}
-
-#[derive(Debug)]
-pub enum BinOpType {
-	Plus,
-	Minus,
-	Mul,
-	Div
-}
-
-#[derive(Debug)]
-pub struct BinOp {
-	pub op: BinOpType,
-	pub left: Expression,
-	pub right: Expression
-}
+use std::str::FromStr;
+use super::*;
 
 named!(i32_digit<&str, i32>, map_res!(
 	digit,
@@ -129,8 +31,9 @@ named!(parse_expr<&str,Expression>, ws!(do_parse!(
 		parse_real     |
 		parse_int      |
 		parse_binop    |
+		parse_unop     |
 		parse_var_expr |
-		parse_expr)    >>
+		map!(parse_expr, |e| Expression::Expression(Box::new(e)))) >>
 	(value)
 )));
 
@@ -164,11 +67,27 @@ named!(parse_var_expr<&str,Expression>, ws!(do_parse!(
 	(Expression::Variable(value))
 )));
 
-named!(parse_binoptype<&str,BinOpType>, ws!(alt!(
-	map!(tag!("+"), |_| BinOpType::Plus) |
-	map!(tag!("-"), |_| BinOpType::Minus) |
-	map!(tag!("*"), |_| BinOpType::Mul) |
-	map!(tag!("/"), |_| BinOpType::Div)
+named!(parse_binoptype<&str,OpType>, ws!(alt!(
+	map!(tag!("+"), |_| OpType::Plus) |
+	map!(tag!("-"), |_| OpType::Minus) |
+	map!(tag!("*"), |_| OpType::Mul) |
+	map!(tag!("/"), |_| OpType::Div) |
+	map!(tag!("=="), |_| OpType::Equal) |
+	map!(tag!("<>"), |_| OpType::NotEqual) |
+	map!(tag!(">"), |_| OpType::Greater) |
+	map!(tag!(">="), |_| OpType::GreaterEqual) |
+	map!(tag!("<"), |_| OpType::Lower) |
+	map!(tag!("<="), |_| OpType::LowerEqual) |
+	map!(tag!(".and."), |_| OpType::And) |
+	map!(tag!(".or."), |_| OpType::Or) |
+	map!(tag!(".not."), |_| OpType::Not)
+)));
+
+named!(parse_unop<&str,Expression>, ws!(do_parse!(
+	tag!("UNOP")       >>
+	op: parse_binoptype >>
+	right: parse_expr   >>
+	(Expression::UnOp(Box::new(UnOp { op, right })))
 )));
 
 named!(parse_binop<&str,Expression>, ws!(do_parse!(
@@ -188,62 +107,36 @@ named!(parse_assign<&str,Statement>, ws!(do_parse!(
 	(Statement::Assignment(Assign { label, lhs, rhs }))
 )));
 
-named!(parse_loop_lower<&str,i32>, ws!(do_parse!(
-	tag!("EXPR")     >>
-	tag!("INT")      >>
-	value: i32_digit >>
-	(value)
+named!(parse_if<&str,Statement>, ws!(do_parse!(
+	tag!("FOR")                       >>
+	tag!("@")                         >>
+	label: i32_digit                  >>
+	expr: parse_expr                  >>
+	then_branch: parse_stmtlist       >>
+	else_branch: parse_stmtlist       >>
+	(Statement::If(If {
+		label, expr, then_branch, else_branch
+	}))
 )));
 
-named!(parse_loop_upper_step<&str,(i32,i32)>, ws!(do_parse!(
-	tag!("EXPR")     >>
-	tag!("BINOP")    >>
-	tag!("-")        >>
-	tag!("EXPR")     >>
-	tag!("INT")      >>
-	upper: i32_digit >>
-	tag!("EXPR")     >>
-	tag!("INT")      >>
-	step: i32_digit  >>
-	((upper, step))
-)));
-
-named!(parse_loop_step<&str,Statement>, ws!(do_parse!(
+named!(parse_loop<&str,Statement>, ws!(do_parse!(
 	tag!("FOR")                       >>
 	tag!("@")                         >>
 	label: i32_digit                  >>
 	var: parse_entry                  >>
-	lower: parse_loop_lower           >>
-	upper_step: parse_loop_upper_step >>
+	lower: parse_expr                 >>
+	upper: parse_expr                 >>
 	statements: parse_stmtlist        >>
 	(Statement::Loop(Loop {
-		label, var, lower,
-		upper: upper_step.0,
-		step: - upper_step.1,
+		label, var, lower, upper,
 		statements
 	}))
 )));
 
-named!(parse_loop_no_step<&str,Statement>, ws!(do_parse!(
-	tag!("FOR")                >>
-	tag!("@")                  >>
-	label: i32_digit           >>
-	var: parse_entry           >>
-	lower: parse_loop_lower    >>
-	upper: parse_loop_lower    >>
-	statements: parse_stmtlist >>
-	(Statement::Loop(Loop { label, var, lower, upper, step: 1 , statements }))
-)));
-
-named!(parse_loop<&str,Statement>, ws!(do_parse!(
-	loops: alt!(parse_loop_step | parse_loop_no_step) >>
-	(loops)
-)));
-
 named!(parse_stmtlist<&str,StatementList>, ws!(do_parse!(
-	tag!("STMTLIST")                              >>
-	list: many0!(alt!(parse_assign | parse_loop)) >>
-	tag!("/STMTLIST")                             >>
+	tag!("STMTLIST")                                         >>
+	list: many0!(alt!(parse_assign | parse_loop | parse_if)) >>
+	tag!("/STMTLIST")                                        >>
 	(StatementList(list))
 )));
 

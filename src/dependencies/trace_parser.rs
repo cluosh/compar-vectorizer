@@ -2,7 +2,7 @@ use std::{io, str::FromStr, collections::HashMap, cmp::Ordering};
 use nom::{digit, types::CompleteStr};
 use super::*;
 
-pub(super) fn read_trace<T>(input: T) -> (Vec<StatementInstance>, Vec<Access>)
+pub(super) fn read_trace<T>(input: T) -> io::Result<(Vec<StatementInstance>, Vec<Access>)>
 	where T: io::BufRead
 {
 	let mut access = Vec::new();
@@ -10,27 +10,18 @@ pub(super) fn read_trace<T>(input: T) -> (Vec<StatementInstance>, Vec<Access>)
 	let mut last_statement = 0;
 	let mut loops = Vec::new();
 	let mut iteration = Vec::new();
+	let mut loop_updated = false;
 
 	for line in input.lines() {
-		let t = match line {
-			Ok(l) => l.parse(),
-			Err(_) => break
-		};
-
-		// Parse trace output line
-		let t = match t {
-			Ok(out) => out,
-			Err(_) => {
-				eprintln!("Could not parse trace line.");
-				continue;
-			}
-		};
+		let t = line?.parse().map_err(|_| io::Error::new(
+			io::ErrorKind::Other, "Could not parse trace line"
+		))?;
 
 		// Deal with different trace outputs
 		match t {
 			TraceOutput::Access(mut a) => {
 				// Begin of new statement instance detected
-		    	if a.statement != last_statement {
+		    	if a.statement != last_statement || loop_updated {
 		    		instances.push(StatementInstance {
 		    			statement: a.statement,
 		    			loops: loops.clone(),
@@ -38,10 +29,11 @@ pub(super) fn read_trace<T>(input: T) -> (Vec<StatementInstance>, Vec<Access>)
 		    		});
 
 		    		last_statement = a.statement;
+		    		loop_updated = false;
 		    	}
 
 		    	// Update reference of statement to instance
-		    	a.statement = instances.len() as u32 - 1;
+		    	a.statement = instances.len() as i32 - 1;
 		    	access.push(a);
 			}
 			TraceOutput::LoopBegin(label) => {
@@ -56,18 +48,20 @@ pub(super) fn read_trace<T>(input: T) -> (Vec<StatementInstance>, Vec<Access>)
 				if let Some(i) = iteration.last_mut() {
 					*i = index
 				}
+
+				loop_updated = true;
 			}
 		}
     }
 
-	(instances, access)
+	Ok((instances, access))
 }
 
 pub(super) fn split_and_sort_trace(trace: Vec<Access>) -> HashMap<String, Vec<Access>> {
 	let mut map: HashMap<String, Vec<Access>> = HashMap::new();
 
 	for a in trace {
-		map.entry(a.array.to_owned())
+		map.entry(a.var.to_owned())
 			.and_modify(|v| v.push(a.clone()))
 			.or_insert(vec![a]);
 	}
@@ -108,11 +102,6 @@ impl PartialEq for Access {
 	}
 }
 
-named!(u32_digit<CompleteStr, u32>, map_res!(
-	digit,
-	|c: CompleteStr| FromStr::from_str(*c)
-));
-
 named!(i32_digit<CompleteStr, i32>, map_res!(
 	digit,
 	|c: CompleteStr| FromStr::from_str(*c)
@@ -124,15 +113,22 @@ named!(category<CompleteStr, Category>, alt!(
 ));
 
 named!(access<CompleteStr, TraceOutput>, ws!(do_parse!(
-	statement: u32_digit            >>
-	array: take_until!(" ")         >>
+	statement: i32_digit            >>
+	var: take_until!(" ")           >>
 	category: category              >>
-	indices: many1!(ws!(u32_digit)) >>
-	(TraceOutput::Access(Access { statement, category, array: array.to_string(), indices }))
+	indices: many1!(ws!(i32_digit)) >>
+	(TraceOutput::Access(Access { statement, category, var: var.to_string(), indices }))
+)));
+
+named!(access_no_indices<CompleteStr, TraceOutput>, ws!(do_parse!(
+	statement: i32_digit            >>
+	var: take_until!(" ")           >>
+	category: category              >>
+	(TraceOutput::Access(Access { statement, category, var: var.to_string(), indices: Vec::new() }))
 )));
 
 named!(loop_begin<CompleteStr, TraceOutput>, ws!(do_parse!(
-	label: u32_digit         >>
+	label: i32_digit         >>
 	_var: take_until!(" ")   >>
 	tag!("loop")             >>
 	tag!("begin")            >>
@@ -140,7 +136,7 @@ named!(loop_begin<CompleteStr, TraceOutput>, ws!(do_parse!(
 )));
 
 named!(loop_end<CompleteStr, TraceOutput>, ws!(do_parse!(
-	_label: u32_digit        >>
+	_label: i32_digit        >>
 	_var: take_until!(" ")   >>
 	tag!("loop")             >>
 	tag!("end")              >>
@@ -148,12 +144,12 @@ named!(loop_end<CompleteStr, TraceOutput>, ws!(do_parse!(
 )));
 
 named!(loop_iteration<CompleteStr, TraceOutput>, ws!(do_parse!(
-	_label: u32_digit        >>
+	_label: i32_digit        >>
 	_index: take_until!(" ") >>
 	value: i32_digit         >>
 	(TraceOutput::LoopUpdate(value))
 )));
 
 named!(parse_trace<CompleteStr, TraceOutput>, alt!(
-	access | loop_begin | loop_end | loop_iteration
+	access | access_no_indices | loop_begin | loop_end | loop_iteration
 ));
