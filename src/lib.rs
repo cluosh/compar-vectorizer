@@ -4,7 +4,7 @@ extern crate nom;
 extern crate serde_derive;
 extern crate petgraph;
 
-pub mod ir;
 pub mod codegen;
 pub mod dependencies;
+pub mod ir;
 pub mod vectorization;
